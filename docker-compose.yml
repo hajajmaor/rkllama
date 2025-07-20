@@ -10,3 +10,14 @@ services:
       - "8080:8080"
       - "11434:11434"
     restart: unless-stopped
+    # devices:
+    #  - /dev/dri/renderD129:/dev/dri/renderD129 # NPU device
+
+
+  tunnel:
+    container_name: cloudflared-tunnel
+    image: cloudflare/cloudflared
+    restart: unless-stopped
+    command: tunnel run
+    environment:
+      - TUNNEL_TOKEN=$TUNNEL_TOKEN
