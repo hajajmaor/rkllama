@@ -413,17 +413,28 @@ def get_current_models():
 # Route to make a request to the model
 @app.route('/generate', methods=['POST'])
 def recevoir_message():
-    global modele_rkllm
-
+    data = request.get_json(force=True)
+    model_name = data.get('model')
+    if not model_name:
+        return jsonify({"error": "Model name required"}), 400
+    
+    # Check if model is loaded
+    if not variables.worker_manager_rkllm.exists_model_loaded(model_name):
+        return jsonify({"error": f"Model '{model_name}' not loaded"}), 400
+    
+    # Get the model instance from WorkerManager
+    modele_rkllm = variables.worker_manager_rkllm.get_worker(model_name)
     if not modele_rkllm:
-        return jsonify({"error": "No models are currently loaded."}), 400
-
+        return jsonify({"error": "Failed to retrieve model"}), 500
+    
     # define modelfile path
     modelfile = os.path.join(modele_rkllm.model_dir, "Modelfile")
 
     variables.verrou.acquire()
-    return Request(modele_rkllm, modelfile)
-
+    try:
+        return Request(modele_rkllm, modelfile)
+    finally:
+        variables.verrou.release()
 
 
 # Ollama API compatibility routes

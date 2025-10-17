@@ -1,12 +1,27 @@
 services:
   rkllama:
     container_name: rkllama
-    image: ghcr.io/notpunchnox/rkllama:main
     build: .
     privileged: true
+    networks:
+      - inner
     volumes:
-      - ./models:/root/RKLLAMA/models
+      - ./models:/opt/rkllama/models
     ports:
       - "8080:8080"
       - "11434:11434"
     restart: unless-stopped
+
+  tunnel:
+    container_name: cloudflared-tunnel
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    networks:
+      - inner
+    command: tunnel run --token ${TUNNEL_TOKEN}
+    environment:
+      - TUNNEL_TOKEN=${TUNNEL_TOKEN}
+      
+networks:
+  inner:
+    driver: bridge
