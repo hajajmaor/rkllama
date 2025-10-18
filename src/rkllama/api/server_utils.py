@@ -4,15 +4,15 @@ import datetime
 import logging
 import os
 import re  # Add import for regex used in JSON extraction
-import src.variables as variables
+import rkllama.api.variables as variables
 from transformers import AutoTokenizer
 from flask import jsonify, Response, stream_with_context
-from .format_utils import create_format_instruction, validate_format_response, get_tool_calls, handle_ollama_response, handle_ollama_embedding_response
+from .format_utils import create_format_instruction, validate_format_response, get_tool_calls, handle_ollama_response, handle_ollama_embedding_response, get_base64_image_from_pil, get_url_image_from_pil
 
-import config
+import rkllama.config
 
 # Check for debug mode using the improved method from config
-DEBUG_MODE = config.is_debug_mode()
+DEBUG_MODE = rkllama.config.is_debug_mode()
 
 # Set up logging based on debug mode
 logging_level = logging.DEBUG if DEBUG_MODE else logging.INFO
@@ -21,7 +21,7 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler(os.path.join(config.get_path("logs"),'rkllama_debug.log')) if DEBUG_MODE else logging.NullHandler()
+        logging.FileHandler(os.path.join(rkllama.config.get_path("logs"),'rkllama_debug.log')) if DEBUG_MODE else logging.NullHandler()
     ]
 )
 logger = logging.getLogger("rkllama.server_utils")
@@ -213,9 +213,9 @@ class ChatEndpointHandler(EndpointHandler):
         else:
             # Send the task of multimodal inference to the model
             variables.worker_manager_rkllm.multimodal(model_name, prompt_tokens, images)
-
-            # Clear the cache of the model to avoid issues with multimodal
+            # Clear the cache to prevent image embedding problems
             variables.worker_manager_rkllm.clear_cache_worker(model_name)
+
         
         # Wait for result queue
         result_q = variables.worker_manager_rkllm.get_result(model_name)
@@ -244,7 +244,7 @@ class ChatEndpointHandler(EndpointHandler):
             
 
             while not thread_finished or not final_sent:
-                token = result_q.get()  # Block until receive any token
+                token = result_q.get(timeout=300)  # Block until receive any token
                 if token == finished_inference_token:
                     thread_finished = True
             
@@ -297,13 +297,17 @@ class ChatEndpointHandler(EndpointHandler):
                 if thread_finished and not final_sent:
                     final_sent = True
 
-                    # Last check for non standard <tool_call> token and tools calls only when finished before the wait token time
-                    if len(final_response_tokens) < max_token_to_wait_for_tool_call:
+                    # Final check for tool calls in the complete response
+                    if tools:
                         json_tool_calls = get_tool_calls("".join(final_response_tokens))
-                        if not tool_calls and json_tool_calls:
-                            tool_calls = True
+                        
+                        # Last check for non standard <tool_call> token and tools calls only when finished before the wait token time
+                        if len(final_response_tokens) < max_token_to_wait_for_tool_call:
+                            if not tool_calls and json_tool_calls:
+                                tool_calls = True
 
-                    if tool_calls:
+                    # If tool calls detected, send them as final response
+                    if tools and tool_calls:
                         chunk_tool_call = cls.format_streaming_chunk(model_name=model_name, token=json_tool_calls, tool_calls=tool_calls)
                         yield f"{json.dumps(chunk_tool_call)}\n"
                     elif len(final_response_tokens)  < max_token_to_wait_for_tool_call: 
@@ -353,6 +357,8 @@ class ChatEndpointHandler(EndpointHandler):
         else:
             # Send the task of multimodal inference to the model
             variables.worker_manager_rkllm.multimodal(model_name, prompt_tokens, images)
+            # Clear the cache to prevent image embedding problems
+            variables.worker_manager_rkllm.clear_cache_worker(model_name)
         
         # Wait for result queue
         result_q = variables.worker_manager_rkllm.get_result(model_name)
@@ -360,7 +366,7 @@ class ChatEndpointHandler(EndpointHandler):
 
 
         while not thread_finished:
-            token = result_q.get()  # Block until receive any token
+            token = result_q.get(timeout=300)  # Block until receive any token
             if token == finished_inference_token:
                 thread_finished = True
                 continue
@@ -533,6 +539,9 @@ class GenerateEndpointHandler(EndpointHandler):
         else:
             # Send the task of multimodal inference to the model
             variables.worker_manager_rkllm.multimodal(model_name, prompt_tokens, images)
+            # Clear the cache to prevent image embedding problems
+            variables.worker_manager_rkllm.clear_cache_worker(model_name)
+
         # Wait for result queue
         result_q = variables.worker_manager_rkllm.get_result(model_name)
         finished_inference_token = variables.worker_manager_rkllm.get_finished_inference_token()
@@ -549,7 +558,7 @@ class GenerateEndpointHandler(EndpointHandler):
             thread_finished = False
  
             while not thread_finished or not final_sent:
-                token = result_q.get()  # Block until receive any token
+                token = result_q.get(timeout=300)  # Block until receive any token
                 if token == finished_inference_token:
                     thread_finished = True
             
@@ -615,12 +624,15 @@ class GenerateEndpointHandler(EndpointHandler):
         else:
             # Send the task of multimodal inference to the model
             variables.worker_manager_rkllm.multimodal(model_name, prompt_tokens, images)
+            # Clear the cache to prevent image embedding problems
+            variables.worker_manager_rkllm.clear_cache_worker(model_name)
+
         # Wait for result queue
         result_q = variables.worker_manager_rkllm.get_result(model_name)
         finished_inference_token = variables.worker_manager_rkllm.get_finished_inference_token()
 
         while not thread_finished:
-            token = result_q.get()  # Block until receive any token
+            token = result_q.get(timeout=300)  # Block until receive any token
             if token == finished_inference_token:
                 thread_finished = True
                 continue
@@ -770,7 +782,7 @@ class EmbedEndpointHandler(EndpointHandler):
         result_q = variables.worker_manager_rkllm.get_result(model_name)
 
         # Wait for the last_embedding hidden layer return
-        embeddings = result_q.get()  
+        embeddings = result_q.get(timeout=300)  
         
         # Calculate metrics
         metrics = cls.calculate_durations(start_time, prompt_eval_time)
@@ -779,6 +791,82 @@ class EmbedEndpointHandler(EndpointHandler):
         # Format response
         response = cls.format_complete_response(model_name, embeddings.tolist(), metrics, None)
         
+        # Return response
+        return jsonify(response), 200
+    
+
+class GenerateImageEndpointHandler(EndpointHandler):
+    """Handler for v1/images/generations endpoint requests"""
+    
+    @staticmethod
+    def format_complete_response(image_list, model_name, model_dir, output_format, response_format, metrics):
+        """Format a complete non-streaming response for generate endpoint"""
+
+        # Construct the default base64 response format
+        data = [{"b64_json": get_base64_image_from_pil(img, output_format)} for img in image_list]
+
+        if response_format == "url":
+            # Construct the output dir for images
+            output_dir = f"{model_dir}/images"
+
+            # Construct the url response format
+            data = [{"url": get_url_image_from_pil(img, model_name, output_dir, output_format)} for img in image_list]
+
+        response = {
+            "created": int(time.time()),
+            "data": data,
+            "usage": {
+                "total_tokens": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "input_tokens_details": {
+                    "text_tokens": 0,
+                    "image_tokens": 0
+                }
+            }
+        }
+        
+        return response
+    
+    @classmethod
+    def handle_request(cls,  model_name, prompt, stream, size, response_format, output_format, num_images, seed, num_inference_steps, guidance_scale):
+        """Process a generate request with proper format handling"""
+
+        if DEBUG_MODE:
+            logger.debug(f"GenerateImageEndpointHandler: processing request for {model_name}")
+        
+        # Check if streaming or not
+        if not stream:
+            # Ollama request handling 
+            ollama_response, code =  cls.handle_complete(model_name, prompt, size, response_format, output_format, num_images, seed, num_inference_steps, guidance_scale)
+        
+            # Return Ollama response
+            return ollama_response, code
+        else:
+            # Streaming not supported for image generation
+            return Response("Streaming not supported yet for image generation", status=400)
+        
+    
+    @classmethod
+    def handle_complete(cls, model_name, prompt, size, response_format, output_format, num_images, seed, num_inference_steps, guidance_scale):
+        """Handle complete generate image response"""
+
+
+        start_time = time.time()
+        prompt_eval_time = None
+        
+        # Use config for models path
+        model_dir = os.path.join(rkllama.config.get_path("models"), model_name)
+
+        # Send the task of embedding to the model
+        image_list = variables.worker_manager_rkllm.generate_image(model_name, model_dir, prompt, size, num_images, seed, num_inference_steps, guidance_scale)
+        
+        # Calculate metrics
+        metrics = cls.calculate_durations(start_time, prompt_eval_time)
+        
+        # Format response
+        response = cls.format_complete_response(image_list, model_name, model_dir, output_format, response_format, metrics)
+
         # Return response
         return jsonify(response), 200
     

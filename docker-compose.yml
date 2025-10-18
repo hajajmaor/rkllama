@@ -8,8 +8,9 @@ services:
     volumes:
       - ./models:/opt/rkllama/models
     ports:
+      # Host:Container
       - "8080:8080"
-      - "11434:11434"
+      - "11432:8080"
     restart: unless-stopped
 
   tunnel:

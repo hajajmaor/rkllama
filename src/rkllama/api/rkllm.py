@@ -23,17 +23,17 @@ class RKLLM(object):
         # Configure RKLLM parameters
         self.rkllm_param = RKLLMParam()
         self.rkllm_param.model_path = bytes(model_path, 'utf-8')
-        self.rkllm_param.max_context_len = int(options.get("num_ctx", config.get("model", "default_num_ctx")))
-        self.rkllm_param.max_new_tokens = int(options.get("max_new_tokens", config.get("model", "default_max_new_tokens")))
-        self.rkllm_param.top_k = int(options.get("top_k", config.get("model", "default_top_k")))
-        self.rkllm_param.top_p = float(options.get("top_p", config.get("model", "default_top_p")))
-        self.rkllm_param.temperature = float(options.get("temperature", config.get("model", "default_temperature")))
-        self.rkllm_param.repeat_penalty = float(options.get("repeat_penalty", config.get("model", "default_repeat_penalty")))
-        self.rkllm_param.frequency_penalty = float(options.get("frequency_penalty", config.get("model", "default_frequency_penalty")))
-        self.rkllm_param.presence_penalty = float(options.get("presence_penalty", config.get("model", "default_presence_penalty")))
-        self.rkllm_param.mirostat = int(options.get("mirostat", config.get("model", "default_mirostat")))
-        self.rkllm_param.mirostat_tau = float(options.get("mirostat_tau", config.get("model", "default_mirostat_tau")))
-        self.rkllm_param.mirostat_eta = float(options.get("mirostat_eta", config.get("model", "default_mirostat_eta")))
+        self.rkllm_param.max_context_len = int(options.get("num_ctx", rkllama.config.get("model", "default_num_ctx")))
+        self.rkllm_param.max_new_tokens = int(options.get("max_new_tokens", rkllama.config.get("model", "default_max_new_tokens")))
+        self.rkllm_param.top_k = int(options.get("top_k", rkllama.config.get("model", "default_top_k")))
+        self.rkllm_param.top_p = float(options.get("top_p", rkllama.config.get("model", "default_top_p")))
+        self.rkllm_param.temperature = float(options.get("temperature", rkllama.config.get("model", "default_temperature")))
+        self.rkllm_param.repeat_penalty = float(options.get("repeat_penalty", rkllama.config.get("model", "default_repeat_penalty")))
+        self.rkllm_param.frequency_penalty = float(options.get("frequency_penalty", rkllama.config.get("model", "default_frequency_penalty")))
+        self.rkllm_param.presence_penalty = float(options.get("presence_penalty", rkllama.config.get("model", "default_presence_penalty")))
+        self.rkllm_param.mirostat = int(options.get("mirostat", rkllama.config.get("model", "default_mirostat")))
+        self.rkllm_param.mirostat_tau = float(options.get("mirostat_tau", rkllama.config.get("model", "default_mirostat_tau")))
+        self.rkllm_param.mirostat_eta = float(options.get("mirostat_eta", rkllama.config.get("model", "default_mirostat_eta")))
 
         # Fixme: these parameters are not used in the current implementation, but they are set to default values
         self.rkllm_param.skip_special_token = True
@@ -41,12 +41,11 @@ class RKLLM(object):
         self.rkllm_param.is_async = False
         self.rkllm_param.use_gpu = True
 
-
         # For Image MultiModal Models
-        self.rkllm_param.img_start = "<|vision_start|>".encode('utf-8');
-        self.rkllm_param.img_end = "<|vision_end|>".encode('utf-8');
-        self.rkllm_param.img_content = "<|image_pad|>".encode('utf-8');
-
+        self.rkllm_param.img_start = options.get("img_start", "").encode("utf-8");
+        self.rkllm_param.img_end = options.get("img_end", "").encode("utf-8");
+        self.rkllm_param.img_content = options.get("img_content", "").encode("utf-8");
+        
         # Extend parameters for RKLLM
         self.rkllm_param.extend_param.base_domain_id = self.base_domain_id
         self.rkllm_param.extend_param.embed_flash = 1
@@ -90,10 +89,12 @@ class RKLLM(object):
 
         self.rkllm_abort = rkllm_lib.rkllm_abort
 
-        # system_prompt = "<|im_start|>system You are a helpful assistant. <|im_end|>"
-        # prompt_prefix = "<|im_start|>user"
-        # prompt_postfix = "<|im_end|><|im_start|>assistant"
-        # self.set_chat_template(self.handle, ctypes.c_char_p(system_prompt.encode('utf-8')), ctypes.c_char_p(prompt_prefix.encode('utf-8')), ctypes.c_char_p(prompt_postfix.encode('utf-8')))
+        # CHeck if chat template options are provided
+        if all(item in options for item in ["system_prompt","prompt_prefix","prompt_postfix"]): 
+            system_prompt = options.get("system_prompt")
+            prompt_prefix = options.get("prompt_prefix")
+            prompt_postfix = options.get("prompt_postfix")
+            self.set_chat_template(self.handle, ctypes.c_char_p(system_prompt.encode('utf-8')), ctypes.c_char_p(prompt_prefix.encode('utf-8')), ctypes.c_char_p(prompt_postfix.encode('utf-8')))
 
         self.lora_adapter_path = None
         self.lora_model_name = None
