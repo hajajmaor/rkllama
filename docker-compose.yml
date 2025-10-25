@@ -3,6 +3,8 @@ services:
     container_name: rkllama
     build: .
     privileged: true
+    environment:
+      - TOKENIZERS_PARALLELISM=false
     networks:
       - inner
     volumes:
@@ -10,7 +12,7 @@ services:
     ports:
       # Host:Container
       - "8080:8080"
-      - "11432:8080"
+      - "11434:11434"
     restart: unless-stopped
 
   tunnel:
