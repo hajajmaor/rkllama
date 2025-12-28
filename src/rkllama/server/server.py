@@ -7,7 +7,6 @@ from flask import Flask, request, jsonify, Response, stream_with_context, send_f
 from flask_cors import CORS
 import random
 
-
 # Local file
 from rkllama.api.classes import *
 from rkllama.api.rkllm import *
@@ -436,6 +435,66 @@ def recevoir_message():
         return Request(modele_rkllm, modelfile)
     finally:
         variables.verrou.release()
+
+# OpenAI API compatibility routes
+
+@app.route('/v1/models', methods=['GET'])
+def list_openai_models():
+    # Return models in OpenAI API format
+    models_dir = rkllama.config.get_path("models")
+    
+    # Check if models exists
+    if not os.path.exists(models_dir):
+        return jsonify({"object": "list", "data": []}), 200
+
+    # Loop over the available models 
+    models = []
+    for subdir in os.listdir(models_dir):
+        subdir_path = os.path.join(models_dir, subdir)
+        if os.path.isdir(subdir_path):
+            for file in os.listdir(subdir_path):
+                if file.endswith(".rkllm") or file.endswith(".rknn") or file == "unet": # Include Stable Diffusion models and Piper Voices
+                    models.append({
+                        "id": subdir,      
+                        "object": "model",      
+                        "created": int(datetime.datetime.fromtimestamp(
+                            os.path.getmtime(os.path.join(subdir_path, file))
+                        ).timestamp()),
+                        "owned_by": "rkllama"
+                    })
+                    break
+
+    return jsonify({"object": "list", "data": models}), 200
+
+
+# Default route
+@app.route('/v1/models/<model_name>', methods=['GET'])
+def list_openai_model(model_name):
+    
+    # Return models in OpenAI API format
+    models_dir = rkllama.config.get_path("models")
+    
+    # Check if models exists
+    if not os.path.exists(models_dir):
+        return jsonify({"error": f"Model '{model_name}' not found"}), 404
+
+    # Loop over the available models to search for the required one
+    for subdir in os.listdir(models_dir):
+        subdir_path = os.path.join(models_dir, subdir)
+        if os.path.isdir(subdir_path):
+            for file in os.listdir(subdir_path):
+                if file.endswith(".rkllm") or file == "unet": # Include Stable Diffusion models
+                    if subdir == model_name:
+                       return jsonify({
+                          "id": subdir,      
+                          "object": "model",      
+                          "created": int(datetime.datetime.fromtimestamp(
+                            os.path.getmtime(os.path.join(subdir_path, file))
+                           ).timestamp()),
+                          "owned_by": "rkllama"
+                    }), 200     
+                    
+    return jsonify({"error": f"Model '{model_name}' not found"}), 404
 
 
 # Ollama API compatibility routes
@@ -1390,6 +1449,135 @@ def get_generated_image(model_name, file_name):
 
     # Return File as attachment
     return send_file(file_path, as_attachment=True)
+
+
+@app.route('/v1/audio/speech', methods=['POST'])
+def generate_speech_openai():
+    
+    lock_acquired = False  # Track lock status
+
+    try:
+        data = request.get_json(force=True)
+        
+        # Supported OpenAI parameters by RKNN
+        input = data.get('input')
+        model_name = data.get('model', None)
+        voice = data.get('voice', None)        
+        response_format = data.get('response_format', 'mp3')
+        stream_format = data.get('stream_format', 'audio')
+        speed = data.get('speed', None)
+        
+        # Non supported OpenAI parameters by Piper
+        instructions = data.get('instructions', None)
+
+        # Not OpenAI parameters, but used by rkllama/piper
+        volume = data.get('volume', None)
+        length_scale = data.get('length_scale', None)
+        noise_scale = data.get('noise_scale', None)
+        noise_w_scale = data.get('noise_w_scale', None)
+        normalize_audio = data.get('normalize_audio', None)
+        
+        # Remove possible namespace in model name. Ollama API allows namespace/model
+        model_name = re.search(r'/(.*)', model_name).group(1) if re.search(r'/', model_name) else model_name
+
+        # Calculate the Piper Lenght Scale bases in speed OpenAI if requested
+        if speed:
+            length_scale = 1 / speed
+
+        if DEBUG_MODE:
+            logger.debug(f"API OpenAI Generate Speech request data: {data}")
+
+        # Acquire lock before processing the request
+        variables.verrou.acquire()
+        lock_acquired = True  # Mark lock as acquired
+        
+        # Process the request - this won't release the lock
+        from rkllama.api.server_utils import GenerateSpeechEndpointHandler
+        return GenerateSpeechEndpointHandler.handle_request(
+              model_name=model_name,
+              input=input,
+              voice=voice,
+              response_format=response_format,
+              stream_format=stream_format,
+              volume=volume,
+              length_scale=length_scale,
+              noise_scale=noise_scale,
+              noise_w_scale=noise_w_scale,
+              normalize_audio=normalize_audio)
+
+    except Exception as e:
+        logger.exception("Error in generate_speech_openai")
+        return jsonify({"error": str(e)}), 500
+    
+    finally:
+        # Only release if we acquired it
+        if lock_acquired and variables.verrou.locked():
+            if DEBUG_MODE:
+                logger.debug("Releasing lock in generate_speech_openai")
+            variables.verrou.release()
+
+
+@app.route('/v1/audio/transcriptions', methods=['POST'])
+def generate_transcriptions_openai():
+    
+    lock_acquired = False  # Track lock status
+
+    try:
+        form = request.form
+
+        # CHeck the file uploaded file
+        if "file" not in request.files:
+            return jsonify({"error": "file field missing"}), 400
+        
+        # Supported OpenAI parameters by RKNN
+        file = request.files["file"]
+        model_name = form.get('model', None)
+        language = form.get('language', None)        
+        response_format = form.get('response_format', 'text')
+        stream = form.get('stream', False)
+        
+        # Non supported OpenAI parameters by Piper
+        chunking_strategy = form.get('chunking_strategy', None)
+        known_speaker_names = form.get('known_speaker_names', None)
+        known_speaker_references = form.get('known_speaker_references', None)
+        prompt = form.get('prompt', None)
+        temperature = form.get('temperature', None)
+        timestamp_granularities = form.get('timestamp_granularities', None)
+
+        # Not OpenAI parameters, but used by rkllama/omnilingual
+
+        # Remove possible namespace in model name. Ollama API allows namespace/model
+        model_name = re.search(r'/(.*)', model_name).group(1) if re.search(r'/', model_name) else model_name
+
+        # Format bool values
+        stream = strtobool(stream) if bool(stream) else False # Disabled by default
+
+        if DEBUG_MODE:
+            logger.debug(f"API OpenAI Generate Transcription request data: {form}")
+
+        # Acquire lock before processing the request
+        variables.verrou.acquire()
+        lock_acquired = True  # Mark lock as acquired
+        
+        # Process the request - this won't release the lock
+        from rkllama.api.server_utils import GenerateTranscriptionsEndpointHandler
+        return GenerateTranscriptionsEndpointHandler.handle_request(
+              model_name=model_name,
+              file=file,
+              language=language,
+              response_format=response_format,
+              stream=stream)
+
+    except Exception as e:
+        logger.exception("Error in generate_transcriptions_openai")
+        return jsonify({"error": str(e)}), 500
+    
+    finally:
+        # Only release if we acquired it
+        if lock_acquired and variables.verrou.locked():
+            if DEBUG_MODE:
+                logger.debug("Releasing lock in generate_transcriptions_openai")
+            variables.verrou.release()
 
 
 # Default route

@@ -25,6 +25,8 @@ WORKER_TASK_ERROR = "<RKLLM_TASK_ERROR>"
 WORKER_TASK_ABORT_INFERENCE = "ABORT"
 WORKER_TASK_CLEAR_CACHE = "CLEAR_CACHE"
 WORKER_TASK_GENERATE_IMAGE = "GENERATE_IMAGE"
+WORKER_TASK_GENERATE_SPEECH = "GENERATE_SPEECH"
+WORKER_TASK_GENERATE_TRANSCRIPTION = "GENERATE_TRANSCRIPTION"
 
 
 def run_encoder(model_input, rknn_queue):
@@ -70,6 +72,51 @@ def run_image_generator(model_input, rknn_queue):
     
     # Send the encoded image to the main process
     rknn_queue.put(image)
+
+
+def run_speech_generator(model_input, rknn_queue):
+    """
+    Run piper generator model to get the audio
+    Args:
+        model_input (tuple): (model_piper_path,input,voice,response_format,stream_format,volume,length_scale,noise_scale,noise_w_scale,normalize_audio)
+        rknn_queue (Queue): Queue to return the audio
+    Returns:
+        str: Audio
+    """
+
+    from .tts import generate_speech
+
+    # Get the arguments for the call
+    model_piper_path,input,voice,response_format,stream_format,volume,length_scale,noise_scale,noise_w_scale,normalize_audio = model_input
+
+    # Run the piper
+    audio = generate_speech(model_piper_path,input,voice,response_format,stream_format,volume,length_scale,noise_scale,noise_w_scale,normalize_audio)
+    
+    # Send the audio bytes to the main process
+    rknn_queue.put(audio)
+
+
+def run_transcription_generator(model_input, rknn_queue):
+    """
+    Run omniasr generator model to get the transcription
+    Args:
+        model_input (tuple): (model_omniasr_path,file,language)
+        rknn_queue (Queue): Queue to return the transcription
+    Returns:
+        str: Transcription
+    """
+
+    from .stt import generate_transcription
+
+    # Get the arguments for the call
+    model_omniasr_path,file,language = model_input
+
+    # Run the omniasr
+    audio = generate_transcription(model_omniasr_path,file,language)
+    
+    # Send the text transcription to the main process
+    rknn_queue.put(audio)
+
 
 
 # RKLLM Worker 
@@ -143,6 +190,9 @@ def run_rkllm_worker(name, task_queue: Queue, result_queue: Queue, model_path, m
                     # If inference not started yet, wait some time to start.
                     if not tokens_processed:
                         time.sleep(0.01)
+
+                # CLear the cache after inference
+                model_rkllm.clear_cache()
 
                 # Send final signal of the inference
                 result_queue.put(WORKER_TASK_FINISHED)
@@ -220,6 +270,46 @@ def run_rknn_process(name, task, model_input, result_queue: Queue):
 
             # Send the image 
             result_queue.put(img)
+
+        elif task == WORKER_TASK_GENERATE_SPEECH:
+            logger.info(f"Running speech generator for model {name}...")
+            # Run piper
+            rknn_queue = Queue()
+
+            # Define the process for piper
+            rknn_process = Process(target=run_speech_generator, args=(model_input,rknn_queue,))
+
+            # Start the piper worker
+            rknn_process.start() 
+
+            # Get the audio from the queue
+            audio = rknn_queue.get(timeout=300)  # Timeout after 300 seconds
+
+            # Terminate the process piper after use
+            rknn_process.terminate()
+
+            # Send the audio 
+            result_queue.put(audio)
+
+        elif task == WORKER_TASK_GENERATE_TRANSCRIPTION:
+            logger.info(f"Running transcription generator for model {name}...")
+            # Run omniasr
+            rknn_queue = Queue()
+
+            # Define the process for omniasr
+            rknn_process = Process(target=run_transcription_generator, args=(model_input,rknn_queue,))
+
+            # Start the omniasr worker
+            rknn_process.start() 
+
+            # Get the text from the queue
+            text = rknn_queue.get(timeout=300)  # Timeout after 300 seconds
+
+            # Terminate the process omniasr after use
+            rknn_process.terminate()
+
+            # Send the text 
+            result_queue.put(text)
 
         else:
             result_queue.put(f"Unknown task: {task}")
@@ -330,7 +420,7 @@ class WorkerManager:
         if model_name not in self.workers.keys():
 
             # Get the available domain id for the RKLLM process
-            base_domain_id = self.get_available_base_domain_id(reverse_order=False)
+            base_domain_id = self.get_available_base_domain_id(reverse_order=True)
 
             # Add the worker to the dictionary of workers
             worker_model = Worker(model_name,base_domain_id)
@@ -383,7 +473,7 @@ class WorkerManager:
         Args:
             model_size (int) -> Size of the model to load
         """
-        return (psutil.virtual_memory().available + psutil.virtual_memory().free) > model_size
+        return (psutil.virtual_memory().available + psutil.virtual_memory().free) > (model_size * 1.20) # Include 20% more memory required than the model size
     
 
     def send_task(self, model_name, task):
@@ -553,6 +643,13 @@ class WorkerManager:
             image_height (int): Height of the image
         """
         if model_name in self.workers.keys():
+            
+            # Get model encoder size
+            model_encoder_size = os.path.getsize(model_encoder_path)
+            # Check if available meory in server for encoder
+            if not self.is_memory_available_for_model(model_encoder_size):
+                # Unload the oldest model until memory avilable
+                self.unload_oldest_models_from_memory(model_encoder_size)
 
             # Prepare the input for the vision encoder
             model_input = (model_encoder_path, images, image_width, image_height)
@@ -620,6 +717,65 @@ class WorkerManager:
         # Return the image
         return image_list;   
 
+
+    def generate_speech(self, model_name, model_dir, input,voice,response_format,stream_format,volume,length_scale,noise_scale,noise_w_scale,normalize_audio) -> None:
+        """
+        Send a generate speech task to the corresponding model worker
+        
+        Args:
+            model_name (str): Worker name to send the task.
+            model_dir (str): Model directory name to invoke
+ 
+        """
+
+        # Prepare the input for piper
+        model_input = (model_dir, input,voice,response_format,stream_format,volume,length_scale,noise_scale,noise_w_scale,normalize_audio)
+
+        # Result queue for the RKNN process
+        result_queue = Queue()
+
+        # Send the Encoder task of the Speech
+        run_rknn_process(model_name, WORKER_TASK_GENERATE_SPEECH,model_input,result_queue)  
+
+        # Wait to confirm output of the image 
+        audio  = result_queue.get(timeout=300)  # Timeout after 60 seconds
+
+        if isinstance(audio, str) and audio ==  WORKER_TASK_ERROR:
+            # Error Generating the speech. Return
+            return None
+
+        # Return the audio
+        return audio
+    
+    def generate_transcription(self, model_name, model_dir, file, language, response_format) -> None:
+        """
+        Send a generate transcription task to the corresponding model worker
+        
+        Args:
+            model_name (str): Worker name to send the task.
+            model_dir (str): Model directory name to invoke
+ 
+        """
+
+        # Prepare the input for omniasr
+        model_input = (model_dir, file, language)
+
+        # Result queue for the RKNN process
+        result_queue = Queue()
+
+        # Send the inference task of the Transcription
+        run_rknn_process(model_name, WORKER_TASK_GENERATE_TRANSCRIPTION,model_input,result_queue)  
+
+        # Wait to confirm output of the image 
+        text  = result_queue.get(timeout=300)  # Timeout after 60 seconds
+
+        if isinstance(text, str) and text ==  WORKER_TASK_ERROR:
+            # Error Generating the transcription. Return
+            return None
+
+        # Return the transcription
+        return text
+    
 
     def get_finished_inference_token(self):
         """
