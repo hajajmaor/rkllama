@@ -1,0 +1,30 @@
+Flask==2.3.2
+requests==2.31.0
+huggingface_hub
+python-dotenv
+transformers
+torch
+flask-cors
+pydantic>=2.0.0
+psutil
+pillow
+diffusers
+numpy<2
+opencv-python
+piper-tts==1.3.0
+pydub
+ffmpeg
+soxr
+soundfile
+
+[:python_version == "3.10"]
+rknn-toolkit-lite2@ file:./src/rkllama/lib/rknn_toolkit_lite2-2.3.2-cp310-cp310-manylinux_2_17_aarch64.manylinux2014_aarch64.whl
+
+[:python_version == "3.11"]
+rknn-toolkit-lite2@ file:./src/rkllama/lib/rknn_toolkit_lite2-2.3.2-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl
+
+[:python_version == "3.12"]
+rknn-toolkit-lite2@ file:./src/rkllama/lib/rknn_toolkit_lite2-2.3.2-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl
+
+[:python_version == "3.9"]
+rknn-toolkit-lite2@ file:./src/rkllama/lib/rknn_toolkit_lite2-2.3.2-cp39-cp39-manylinux_2_17_aarch64.manylinux2014_aarch64.whl

@@ -605,6 +605,9 @@ def ollama_chat_stream_to_openai_chat_completions_chunks(ollama_stream_lines):
 
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
+    last_prompt_tokens = None
+    last_completion_tokens = None
+    last_eval_duration_ns = None
     for line in ollama_stream_lines:
         line = str(line).strip()
         if not line or line.startswith("data:"):
@@ -614,6 +617,14 @@ def ollama_chat_stream_to_openai_chat_completions_chunks(ollama_stream_lines):
             ollama_chunk = json.loads(line)
         except json.JSONDecodeError:
             continue
+
+        # Track metrics if present (usually only on final Ollama chunk)
+        if "prompt_eval_count" in ollama_chunk:
+            last_prompt_tokens = ollama_chunk.get("prompt_eval_count")
+        if "eval_count" in ollama_chunk:
+            last_completion_tokens = ollama_chunk.get("eval_count")
+        if "eval_duration" in ollama_chunk:
+            last_eval_duration_ns = ollama_chunk.get("eval_duration")
 
         content_piece = ollama_chunk.get("message", {}).get("content", "")
         role = ollama_chunk.get("message", {}).get("role")
@@ -649,6 +660,22 @@ def ollama_chat_stream_to_openai_chat_completions_chunks(ollama_stream_lines):
 
         if ollama_chunk.get("done") is True:
             # Final chunk — stop streaming
+            usage = {}
+            if last_prompt_tokens is not None:
+                usage["prompt_tokens"] = int(last_prompt_tokens)
+            if last_completion_tokens is not None:
+                usage["completion_tokens"] = int(last_completion_tokens)
+            if "prompt_tokens" in usage or "completion_tokens" in usage:
+                usage["total_tokens"] = usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
+            # Non-standard but expected by rkllama_client verbose mode
+            if last_completion_tokens is not None and last_eval_duration_ns:
+                try:
+                    eval_seconds = float(last_eval_duration_ns) / 1_000_000_000.0
+                    if eval_seconds > 0:
+                        usage["tokens_per_second"] = float(last_completion_tokens) / eval_seconds
+                except Exception:
+                    pass
+
             final_chunk = {
                 "id": completion_id,
                 "object": "chat.completion.chunk",
@@ -656,6 +683,8 @@ def ollama_chat_stream_to_openai_chat_completions_chunks(ollama_stream_lines):
                 "model": model,
                 "choices": []
             }
+            if usage:
+                final_chunk["usage"] = usage
             yield f"data: {json.dumps(final_chunk)}\n\n"
             yield "data: [DONE]\n\n"
             break
@@ -674,6 +703,9 @@ def ollama_generate_stream_to_openai_completions_chunks(ollama_stream_lines):
 
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
+    last_prompt_tokens = None
+    last_completion_tokens = None
+    last_eval_duration_ns = None
     for line in ollama_stream_lines:
         line = str(line).strip()
         if not line or line.startswith("data:"):
@@ -683,6 +715,14 @@ def ollama_generate_stream_to_openai_completions_chunks(ollama_stream_lines):
             ollama_chunk = json.loads(line)
         except json.JSONDecodeError:
             continue
+
+        # Track metrics if present (usually only on final Ollama chunk)
+        if "prompt_eval_count" in ollama_chunk:
+            last_prompt_tokens = ollama_chunk.get("prompt_eval_count")
+        if "eval_count" in ollama_chunk:
+            last_completion_tokens = ollama_chunk.get("eval_count")
+        if "eval_duration" in ollama_chunk:
+            last_eval_duration_ns = ollama_chunk.get("eval_duration")
 
         content_piece = ollama_chunk.get("response", "")
         model = ollama_chunk.get("model", "unknown-model")
@@ -704,6 +744,21 @@ def ollama_generate_stream_to_openai_completions_chunks(ollama_stream_lines):
 
         if ollama_chunk.get("done") is True:
             # Final chunk — stop streaming
+            usage = {}
+            if last_prompt_tokens is not None:
+                usage["prompt_tokens"] = int(last_prompt_tokens)
+            if last_completion_tokens is not None:
+                usage["completion_tokens"] = int(last_completion_tokens)
+            if "prompt_tokens" in usage or "completion_tokens" in usage:
+                usage["total_tokens"] = usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
+            if last_completion_tokens is not None and last_eval_duration_ns:
+                try:
+                    eval_seconds = float(last_eval_duration_ns) / 1_000_000_000.0
+                    if eval_seconds > 0:
+                        usage["tokens_per_second"] = float(last_completion_tokens) / eval_seconds
+                except Exception:
+                    pass
+
             final_chunk = {
                 "id": completion_id,
                 "object": "chat.completion.chunk",
@@ -711,6 +766,8 @@ def ollama_generate_stream_to_openai_completions_chunks(ollama_stream_lines):
                 "model": model,
                 "choices": []
             }
+            if usage:
+                final_chunk["usage"] = usage
             yield f"data: {json.dumps(final_chunk)}\n\n"
             yield "data: [DONE]\n\n"
             break

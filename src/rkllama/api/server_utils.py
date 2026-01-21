@@ -4,12 +4,14 @@ import datetime
 import logging
 import os
 import re  # Add import for regex used in JSON extraction
+import threading
 import rkllama.api.variables as variables
 from transformers import AutoTokenizer
 from flask import jsonify, Response, stream_with_context
 from .format_utils import create_format_instruction, validate_format_response, get_tool_calls, handle_ollama_response, handle_ollama_embedding_response, get_base64_image_from_pil, get_url_image_from_pil
 from .model_utils import get_property_modelfile
 import rkllama.config
+from .worker import WORKER_TASK_ERROR
 
 # Check for debug mode using the improved method from config
 DEBUG_MODE = rkllama.config.is_debug_mode()
@@ -25,6 +27,11 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger("rkllama.server_utils")
+
+
+# Tokenizer cache (prevents repeated HF downloads and re-init)
+_TOKENIZER_CACHE = {}
+_TOKENIZER_CACHE_LOCK = threading.Lock()
 
 
 class RequestWrapper:
@@ -45,18 +52,113 @@ class EndpointHandler:
         # Get model specific tokenizer from Huggin Face specified in Modelfile
         model_in_hf = get_property_modelfile(model_name, "HUGGINGFACE_PATH", rkllama.config.get_path("models")).replace('"', '').replace("'", "")
 
-        # Get the tokenizer configured for the model
-        tokenizer = AutoTokenizer.from_pretrained(model_in_hf, trust_remote_code=True)
-        supports_system_role = "raise_exception('System role not supported')" not in tokenizer.chat_template
+        # Prefer local tokenizer files when available, and cache the tokenizer object
+        models_root = rkllama.config.get_path("models")
+        local_model_dir = os.path.join(models_root, model_name)
+        local_tokenizer_dir = os.path.join(local_model_dir, "tokenizer")
+
+        cache_key = f"{model_in_hf}::{local_tokenizer_dir}"
+        with _TOKENIZER_CACHE_LOCK:
+            tokenizer = _TOKENIZER_CACHE.get(cache_key)
+
+        if tokenizer is None:
+            tokenizer_source = model_in_hf
+            used_local_source = False
+
+            # If we have previously downloaded tokenizer assets (or user provided them), use them.
+            if os.path.isdir(local_tokenizer_dir):
+                tokenizer_source = local_tokenizer_dir
+                used_local_source = True
+            else:
+                # If the model dir itself contains tokenizer files, use it as source.
+                # This helps for offline use when tokenizer files are placed next to Modelfile.
+                for fname in ["tokenizer.json", "tokenizer.model", "tokenizer_config.json", "special_tokens_map.json"]:
+                    if os.path.exists(os.path.join(local_model_dir, fname)):
+                        tokenizer_source = local_model_dir
+                        used_local_source = True
+                        break
+
+            try:
+                logger.debug(f"Attempting to load tokenizer from source: {tokenizer_source} (used_local_source={used_local_source}) cache_key={cache_key}")
+                tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, trust_remote_code=True)
+                logger.debug(f"Loaded tokenizer from source: {tokenizer_source}")
+            except Exception:
+                # Fallback: try HF id; for offline environments this may still fail, but
+                # we keep the original exception semantics after the second attempt.
+                import traceback
+                logger.debug(f"Failed loading tokenizer from {tokenizer_source}, falling back to HF id {model_in_hf}", exc_info=True)
+                tokenizer = AutoTokenizer.from_pretrained(model_in_hf, trust_remote_code=True)
+                logger.debug(f"Loaded tokenizer from HF id: {model_in_hf}")
+
+            # If the tokenizer came from HuggingFace, persist it under the model directory.
+            # This makes future runs offline-friendly and avoids repeated fetches across restarts.
+            if not used_local_source:
+                try:
+                    os.makedirs(local_tokenizer_dir, exist_ok=True)
+                    tokenizer.save_pretrained(local_tokenizer_dir)
+                    logger.debug(f"Persisted tokenizer to {local_tokenizer_dir}")
+                except Exception as e:
+                    if DEBUG_MODE:
+                        logger.debug(f"Failed to persist tokenizer to {local_tokenizer_dir}: {e}")
+
+            with _TOKENIZER_CACHE_LOCK:
+                _TOKENIZER_CACHE[cache_key] = tokenizer
+                logger.debug(f"Cached tokenizer under key: {cache_key}")
+
+        chat_template = getattr(tokenizer, "chat_template", None) or ""
+        supports_system_role = "raise_exception('System role not supported')" not in chat_template
         
         if system and supports_system_role:
             prompt_messages = [{"role": "system", "content": system}] + messages
         else:
             prompt_messages = messages
-        
-        prompt_tokens = tokenizer.apply_chat_template(prompt_messages, tools=tools, tokenize=True, add_generation_prompt=True, enable_thinking=enable_thinking)
 
-        return tokenizer, prompt_tokens, len(prompt_tokens)
+        # Normalize prompt_messages: ensure every message is a dict with 'role' and 'content'
+        normalized = []
+        for msg in prompt_messages:
+            if isinstance(msg, str):
+                normalized.append({"role": "user", "content": msg})
+            elif isinstance(msg, dict):
+                # Ensure content exists and is a string
+                content = msg.get("content", "")
+                if content is None:
+                    content = ""
+                normalized.append({"role": msg.get("role", "user"), "content": str(content)})
+            else:
+                # Fallback to string representation
+                normalized.append({"role": "user", "content": str(msg)})
+        prompt_messages = normalized
+        
+        # Some tokenizers may not ship a chat template (tokenizer.chat_template is None).
+        # In that case we fall back to a simple role-formatted prompt.
+        prompt_text = None  # Store raw text for CLI-based workers
+        if getattr(tokenizer, "chat_template", None):
+            # Generate prompt text before tokenizing (for CLI workers)
+            prompt_text = tokenizer.apply_chat_template(
+                prompt_messages,
+                tools=tools,
+                tokenize=False,  # Get text, not tokens
+                add_generation_prompt=True,
+                enable_thinking=enable_thinking,
+            )
+            prompt_tokens = tokenizer.apply_chat_template(
+                prompt_messages,
+                tools=tools,
+                tokenize=True,
+                add_generation_prompt=True,
+                enable_thinking=enable_thinking,
+            )
+        else:
+            prompt_text_lines = []
+            for msg in prompt_messages:
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+                prompt_text_lines.append(f"{role}: {content}")
+            prompt_text_lines.append("assistant:")
+            prompt_text = "\n".join(prompt_text_lines)
+            prompt_tokens = tokenizer.encode(prompt_text, add_special_tokens=False)
+
+        return tokenizer, prompt_tokens, len(prompt_tokens), prompt_text
     
 
     @staticmethod
@@ -165,9 +267,10 @@ class ChatEndpointHandler(EndpointHandler):
             # If Multimodal request, do not use tokenizer
             prompt_tokens = None
             prompt_token_count = None
+            prompt_text = None
             if not images:    
                 # Create the prompts tokens for text only requests
-                tokenizer, prompt_tokens, prompt_token_count = cls.prepare_prompt(model_name, messages, system, tools, enable_thinking)
+                tokenizer, prompt_tokens, prompt_token_count, prompt_text = cls.prepare_prompt(model_name, messages, system, tools, enable_thinking)
             
             else:
                 if DEBUG_MODE:
@@ -182,7 +285,7 @@ class ChatEndpointHandler(EndpointHandler):
             # Ollama request handling 
             if stream:
                 ollama_chunk = cls.handle_streaming(model_name, prompt_tokens, 
-                                          prompt_token_count, format_spec, tools, enable_thinking, images)
+                                          prompt_token_count, format_spec, tools, enable_thinking, images, prompt_text=prompt_text)
                 if is_openai_request:
 
                     # Use unified handler
@@ -195,7 +298,7 @@ class ChatEndpointHandler(EndpointHandler):
                 return ollama_chunk
             else:
                 ollama_response, code =  cls.handle_complete(model_name, prompt_tokens, 
-                                         prompt_token_count, format_spec, tools, enable_thinking,images)
+                                         prompt_token_count, format_spec, tools, enable_thinking,images, prompt_text=prompt_text)
                 
                 if is_openai_request:
                     # Convert Ollama response to OpenAI format
@@ -208,13 +311,13 @@ class ChatEndpointHandler(EndpointHandler):
             variables.system = original_system
             
     @classmethod
-    def handle_streaming(cls, model_name, prompt_tokens, prompt_token_count, format_spec, tools, enable_thinking, images=None):
+    def handle_streaming(cls, model_name, prompt_tokens, prompt_token_count, format_spec, tools, enable_thinking, images=None, prompt_text=None):
         """Handle streaming chat response"""
 
         # Check if multimodal or text only
         if not images:
             # Send the task of inference to the model
-            variables.worker_manager_rkllm.inference(model_name, prompt_tokens)
+            variables.worker_manager_rkllm.inference(model_name, prompt_tokens, prompt_text=prompt_text)
         else:
             # Send the task of multimodal inference to the model
             variables.worker_manager_rkllm.multimodal(model_name, prompt_tokens, images)
@@ -345,7 +448,7 @@ class ChatEndpointHandler(EndpointHandler):
     
 
     @classmethod
-    def handle_complete(cls, model_name, prompt_tokens, prompt_token_count, format_spec, tools, enable_thinking, images=None):
+    def handle_complete(cls, model_name, prompt_tokens, prompt_token_count, format_spec, tools, enable_thinking, images=None, prompt_text=None):
         """Handle complete non-streaming chat response"""
         
         start_time = time.time()
@@ -358,7 +461,7 @@ class ChatEndpointHandler(EndpointHandler):
         # Check if multimodal or text only
         if not images:
             # Send the task of inference to the model
-            variables.worker_manager_rkllm.inference(model_name, prompt_tokens)
+            variables.worker_manager_rkllm.inference(model_name, prompt_tokens, prompt_text=prompt_text)
         else:
             # Send the task of multimodal inference to the model
             variables.worker_manager_rkllm.multimodal(model_name, prompt_tokens, images)
@@ -496,9 +599,10 @@ class GenerateEndpointHandler(EndpointHandler):
             # If Multimodal request, do not use tokenizer
             prompt_tokens = None
             prompt_token_count = None
+            prompt_text = None
             if not images:    
                 # Create the prompts tokens for text only requests
-                tokenizer, prompt_tokens, prompt_token_count = cls.prepare_prompt(model_name=model_name, messages=messages, system=system,enable_thinking=enable_thinking)
+                tokenizer, prompt_tokens, prompt_token_count, prompt_text = cls.prepare_prompt(model_name=model_name, messages=messages, system=system,enable_thinking=enable_thinking)
             else:
                 if DEBUG_MODE:
                     logger.debug(f"Multimodal request detected. Skipping tokenization.")
@@ -508,7 +612,7 @@ class GenerateEndpointHandler(EndpointHandler):
             # Ollama request handling 
             if stream:
                 ollama_chunk = cls.handle_streaming(model_name, prompt_tokens, 
-                                          prompt_token_count, format_spec, enable_thinking, images)
+                                          prompt_token_count, format_spec, enable_thinking, images, prompt_text=prompt_text)
                 if is_openai_request:
 
                     # Use unified handler
@@ -521,7 +625,7 @@ class GenerateEndpointHandler(EndpointHandler):
                 return ollama_chunk
             else:
                 ollama_response, code =  cls.handle_complete(model_name, prompt_tokens, 
-                                         prompt_token_count, format_spec, enable_thinking, images)
+                                         prompt_token_count, format_spec, enable_thinking, images, prompt_text=prompt_text)
                 
                 if is_openai_request:
                     # Convert Ollama response to OpenAI format
@@ -534,13 +638,13 @@ class GenerateEndpointHandler(EndpointHandler):
             variables.system = original_system
     
     @classmethod
-    def handle_streaming(cls, model_name, prompt_tokens, prompt_token_count, format_spec, enable_thinking, images=None):
+    def handle_streaming(cls, model_name, prompt_tokens, prompt_token_count, format_spec, enable_thinking, images=None, prompt_text=None):
         """Handle streaming generate response"""
 
         # Check if multimodal or text only
         if not images:
             # Send the task of inference to the model
-            variables.worker_manager_rkllm.inference(model_name, prompt_tokens)
+            variables.worker_manager_rkllm.inference(model_name, prompt_tokens, prompt_text=prompt_text)
         else:
             # Send the task of multimodal inference to the model
             variables.worker_manager_rkllm.multimodal(model_name, prompt_tokens, images)
@@ -612,7 +716,7 @@ class GenerateEndpointHandler(EndpointHandler):
         return Response(generate(), content_type='application/x-ndjson')
     
     @classmethod
-    def handle_complete(cls, model_name, prompt_tokens, prompt_token_count, format_spec, enable_thinking, images=None):
+    def handle_complete(cls, model_name, prompt_tokens, prompt_token_count, format_spec, enable_thinking, images=None, prompt_text=None):
         """Handle complete generate response"""
 
         start_time = time.time()
@@ -625,7 +729,7 @@ class GenerateEndpointHandler(EndpointHandler):
         # Check if multimodal or text only
         if not images:
             # Send the task of inference to the model
-            variables.worker_manager_rkllm.inference(model_name, prompt_tokens)
+            variables.worker_manager_rkllm.inference(model_name, prompt_tokens, prompt_text=prompt_text)
         else:
             # Send the task of multimodal inference to the model
             variables.worker_manager_rkllm.multimodal(model_name, prompt_tokens, images)
@@ -761,8 +865,51 @@ class EmbedEndpointHandler(EndpointHandler):
         
         variables.global_status = -1
 
-        # Create the prompts
-        _, prompt_tokens, prompt_token_count = cls.prepare_prompt(model_name=model_name, messages=input_text)
+        # Normalize input_text for embeddings API:
+        # - If input_text is a list of strings (OpenAI-style), convert to messages list
+        # - If already a list of role/content dicts, keep as-is
+        messages_for_prompt = None
+        try:
+            if isinstance(input_text, list) and input_text and isinstance(input_text[0], str):
+                messages_for_prompt = [{"role": "user", "content": s} for s in input_text]
+            elif isinstance(input_text, list) and input_text and isinstance(input_text[0], dict):
+                messages_for_prompt = input_text
+            elif isinstance(input_text, str):
+                messages_for_prompt = [{"role": "user", "content": input_text}]
+            else:
+                # Fallback: wrap as single user message
+                messages_for_prompt = [{"role": "user", "content": str(input_text)}]
+        except Exception:
+            messages_for_prompt = [{"role": "user", "content": str(input_text)}]
+
+        # Create the prompts; tokenizer.chat_template may raise for some inputs — fallback to simple tokenization
+        try:
+            _, prompt_tokens, prompt_token_count, prompt_text = cls.prepare_prompt(model_name=model_name, messages=messages_for_prompt)
+        except Exception as e:
+            logger.debug(f"prepare_prompt failed, falling back to simple tokenization: {e}")
+            # Try to load tokenizer directly and encode the first input string
+            models_root = rkllama.config.get_path("models")
+            local_model_dir = os.path.join(models_root, model_name)
+            local_tokenizer_dir = os.path.join(local_model_dir, "tokenizer")
+            tokenizer_source = local_tokenizer_dir if os.path.isdir(local_tokenizer_dir) else get_property_modelfile(model_name, "HUGGINGFACE_PATH", rkllama.config.get_path("models")).replace('"','').replace("'", "")
+            try:
+                tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, trust_remote_code=True)
+            except Exception:
+                tokenizer = AutoTokenizer.from_pretrained(get_property_modelfile(model_name, "HUGGINGFACE_PATH", rkllama.config.get_path("models")), trust_remote_code=True)
+
+            # Determine a raw text to tokenize
+            if isinstance(input_text, list) and input_text:
+                first = input_text[0]
+                if isinstance(first, dict):
+                    raw_text = first.get("content", "")
+                else:
+                    raw_text = str(first)
+            else:
+                raw_text = str(input_text)
+
+            prompt_tokens = tokenizer.encode(raw_text, add_special_tokens=False)
+            prompt_token_count = len(prompt_tokens)
+            prompt_text = raw_text
 
         # Ollama request handling 
         ollama_response, code =  cls.handle_complete(model_name, prompt_tokens, prompt_token_count)
@@ -782,22 +929,43 @@ class EmbedEndpointHandler(EndpointHandler):
         start_time = time.time()
         prompt_eval_time = None
         
-        # Send the task of embedding to the model
+        # Send the task of embedding to the model (ctypes path)
         variables.worker_manager_rkllm.embedding(model_name, input_tokens)
         result_q = variables.worker_manager_rkllm.get_result(model_name)
 
-        # Wait for the last_embedding hidden layer return
-        embeddings = result_q.get(timeout=300)  
-        
-        # Calculate metrics
-        metrics = cls.calculate_durations(start_time, prompt_eval_time)
-        metrics["prompt_tokens"] = prompt_token_count
-        
-        # Format response
-        response = cls.format_complete_response(model_name, embeddings.tolist(), metrics, None)
-        
-        # Return response
-        return jsonify(response), 200
+        # Wait for the last_hidden_layer return
+        embeddings = result_q.get(timeout=300)
+
+        # Handle worker-level errors
+        if isinstance(embeddings, str):
+            # Propagate worker error
+            if embeddings == WORKER_TASK_ERROR:
+                return jsonify({"error": "Worker failed to produce embeddings"}), 500
+            return jsonify({"error": embeddings}), 500
+
+        # At this point embeddings should be a numpy array-like object
+        try:
+            # Calculate metrics
+            metrics = cls.calculate_durations(start_time, prompt_eval_time)
+            metrics["prompt_tokens"] = prompt_token_count
+
+            # Defensive: convert embeddings to list
+            if hasattr(embeddings, "tolist"):
+                emb_list = embeddings.tolist()
+            elif isinstance(embeddings, (list, tuple)):
+                emb_list = list(embeddings)
+            else:
+                logger.error(f"Unexpected embeddings type: {type(embeddings)}")
+                return jsonify({"error": f"Unexpected embeddings type: {type(embeddings)}"}), 500
+
+            # Format response
+            response = cls.format_complete_response(model_name, emb_list, metrics, None)
+
+            # Return response
+            return jsonify(response), 200
+        except Exception as e:
+            logger.exception(f"Failed formatting embeddings response: {e}")
+            return jsonify({"error": str(e)}), 500
     
 
 class GenerateImageEndpointHandler(EndpointHandler):

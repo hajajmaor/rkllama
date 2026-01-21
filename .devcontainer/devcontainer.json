@@ -1,0 +1,22 @@
+{
+  "name": "rkllama Dev Container",
+  "build": {
+    "dockerfile": "../Dockerfile",
+    "context": ".."
+  },
+  "privileged": true,
+  "mounts": [
+    "source=/dev,target=/dev,type=bind"
+  ],
+  "forwardPorts": [
+    8080,
+    8000,
+    7860
+  ],
+  "postCreateCommand": "pip install --upgrade pip && pip install -r converter/requirements.txt || true && pip install -e . || true",
+  "remoteUser": "root",
+  "containerEnv": {
+    "PYTHONPATH": "/workspaces/rkllama:/workspaces/rkllama/src"
+  },
+  "workspaceFolder": "/workspaces/rkllama"
+}

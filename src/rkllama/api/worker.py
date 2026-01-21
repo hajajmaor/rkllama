@@ -74,6 +74,48 @@ def run_image_generator(model_input, rknn_queue):
     rknn_queue.put(image)
 
 
+def run_embedding_process(process_args, result_queue):
+    """
+    Run RKLLM in a separate process to compute embeddings and return via queue.
+    process_args: tuple containing (model_path, model_dir, options, lora_model_path, prompt_cache_path, base_domain_id, inference_mode, input_type, model_input)
+    result_queue: multiprocessing.Queue to return the embeddings (numpy array) or error string
+    """
+    try:
+        from .rkllm import RKLLM
+        from .classes import callback_type, RKLLMInferMode, RKLLMInputType, LLMCallState
+        import ctypes
+        import numpy as np
+
+        model_path, model_dir, options, lora_model_path, prompt_cache_path, base_domain_id, inference_mode, input_type, model_input = process_args
+
+        # Local callback to capture embeddings and forward to result_queue
+        def _callback_impl(result_ptr, userdata, status):
+            try:
+                if status == LLMCallState.RKLLM_RUN_NORMAL:
+                    if result_ptr and result_ptr.contents and result_ptr.contents.last_hidden_layer.embd_size != 0:
+                        num_tokens = result_ptr.contents.last_hidden_layer.num_tokens
+                        embd_size = result_ptr.contents.last_hidden_layer.embd_size
+                        if num_tokens > 0 and embd_size > 0:
+                            total = num_tokens * embd_size
+                            array_type = ctypes.c_float * total
+                            raw = array_type.from_address(ctypes.addressof(result_ptr.contents.last_hidden_layer.hidden_states.contents))
+                            embeddings = np.ctypeslib.as_array(raw).copy()
+                            embeddings = embeddings.reshape((num_tokens, embd_size))
+                            result_queue.put(embeddings)
+            except Exception as e:
+                result_queue.put(f"callback_error: {e}")
+
+        cb = callback_type(_callback_impl)
+        rk = RKLLM(cb, model_path, model_dir, options or {}, lora_model_path, prompt_cache_path, base_domain_id)
+        rk.run(inference_mode, input_type, model_input)
+        # If callback didn't push embeddings, indicate error
+        if result_queue.empty():
+            result_queue.put(WORKER_TASK_ERROR)
+        rk.release()
+    except Exception as e:
+        result_queue.put(str(e))
+
+
 def run_speech_generator(model_input, rknn_queue):
     """
     Run piper generator model to get the audio
@@ -119,28 +161,41 @@ def run_transcription_generator(model_input, rknn_queue):
 
 
 
-# RKLLM Worker 
+# RKLLM Worker using hybrid approach: CLI for generation, ctypes for embeddings
 def run_rkllm_worker(name, task_queue: Queue, result_queue: Queue, model_path, model_dir, options=None, lora_model_path = None, prompt_cache_path = None, base_domain_id = 0):
     
-    # Initialize individual callback for each worker to prevent error from RKLLM
-    from .callback import callback_impl, global_status, global_text,split_byte_data, last_embeddings
-    from .rkllm import RKLLM
-
-    # Connect the callback function between Python and C++ independently for each worker
-    callback = callback_type(callback_impl)
-
-    # Define the model used by the worker
-    try:
-        model_rkllm = RKLLM(callback, model_path, model_dir, options, lora_model_path, prompt_cache_path, base_domain_id)
+    # Use the CLI wrapper for text generation
+    from .rkllm_cli import RKLLMCLIWrapper
     
-        # Announce the creation of the RKLLM model failed
-        result_queue.put(WORKER_TASK_FINISHED)
+    # Keep ctypes wrapper available for embeddings
+    from .callback import callback_impl, global_text, last_embeddings
+    from .rkllm import RKLLM
+    from .classes import callback_type
 
+    # Extract max tokens from options if provided
+    max_new_tokens = 512
+    max_context_len = 4096
+    if options:
+        # Read from options object (attributes set in server_utils.py from Modelfile/config)
+        max_new_tokens = getattr(options, 'max_new_tokens', 512)
+        max_context_len = getattr(options, 'num_ctx', 4096)
+
+    # Initialize CLI wrapper for text generation
+    model_cli = None
+    try:
+        model_cli = RKLLMCLIWrapper(model_path, max_new_tokens, max_context_len)
+        logger.info(f"CLI wrapper initialized for model {name}")
     except Exception as e:
-        logger.error(f"Failed creating the worker for model '{name}': {str(e)}")
-        # Announce the creation of the RKLLM model in memory
+        logger.error(f"Failed creating CLI wrapper for model '{name}': {str(e)}")
         result_queue.put(WORKER_TASK_ERROR)
         return
+    
+    # Initialize ctypes wrapper for embeddings (lazy - only when needed)
+    model_ctypes = None
+    callback = None
+    
+    # Announce the creation of the RKLLM model succeeded
+    result_queue.put(WORKER_TASK_FINISHED)
 
     # Loop to wait for tasks
     while True:
@@ -152,67 +207,86 @@ def run_rkllm_worker(name, task_queue: Queue, result_queue: Queue, model_path, m
 
             if task == WORKER_TASK_UNLOAD_MODEL:
                 logger.info(f"Unloading model {name}...")
-                # Unload the model
-                model_rkllm.release()
+                # Unload the CLI wrapper
+                if model_cli:
+                    model_cli.release()
+                # Unload ctypes wrapper if initialized
+                if model_ctypes:
+                    model_ctypes.release()
 
                 # Exit the loop of the worker to finish the process
                 break
             
             elif task == WORKER_TASK_ABORT_INFERENCE:
                 logger.info(f"Aborting inference for model {name}...")
-                # Abort the inference of the model
-                model_rkllm.abort()
+                # Abort the inference of the model (CLI only)
+                if model_cli:
+                    model_cli.abort()
 
             elif task == WORKER_TASK_CLEAR_CACHE:
                 logger.info(f"Clearing KV cache for model {name}...")
-                # CLear the cache of the model
-                model_rkllm.clear_cache()
+                # Clear the cache of the CLI model
+                if model_cli:
+                    model_cli.clear_cache()
+                # Clear cache of ctypes model if initialized
+                if model_ctypes:
+                    model_ctypes.clear_cache()
 
             elif task == WORKER_TASK_INFERENCE:
                 logger.info(f"Running inference for model {name}...")
-                # Run inference
-                thread_model = threading.Thread(target=model_rkllm.run, args=(inference_mode, model_input_type, model_input,))
-                thread_model.start()
                 
-                # Looping until execution of the thread
-                thread_finished = False
-                while not thread_finished:
-                    tokens_processed = False
-                    while len(global_text) > 0:
-                        tokens_processed = False
-                        token = global_text.pop(0)
+                # For CLI wrapper, model_input should now always be a text prompt string
+                prompt = str(model_input)
+                
+                # Run inference using the CLI wrapper's generator
+                try:
+                    for token in model_cli.run(prompt):
+                        # Send each token to the result queue
                         result_queue.put(token)
-
-                    # Update status of the thread    
-                    thread_model.join(timeout=0.005)
-                    thread_finished = not thread_model.is_alive()
-                    
-                    # If inference not started yet, wait some time to start.
-                    if not tokens_processed:
-                        time.sleep(0.01)
-
-                # CLear the cache after inference
-                model_rkllm.clear_cache()
+                except Exception as e:
+                    logger.error(f"Error during inference: {e}")
+                    result_queue.put(WORKER_TASK_ERROR)
 
                 # Send final signal of the inference
                 result_queue.put(WORKER_TASK_FINISHED)
 
             elif task == WORKER_TASK_EMBEDDING:
                 logger.info(f"Running embedding for model {name}...")
-                # Run inference
-                thread_model = threading.Thread(target=model_rkllm.run, args=(inference_mode, model_input_type, model_input,))
-                thread_model.start()
-                
-                # Looping until execution of the thread finished
-                thread_finished = False
-                while not thread_finished:
-                    # Update status of the thread    
-                    thread_model.join(timeout=0.005)
-                    thread_finished = not thread_model.is_alive()
+                # Use in-process ctypes RKLLM for embeddings (original rkllama behavior)
+                try:
+                    # Initialize ctypes wrapper if not already
+                    if model_ctypes is None:
+                        cb = callback_type(callback_impl)
+                        model_ctypes = RKLLM(cb, model_path, model_dir, options or {}, lora_model_path, prompt_cache_path, base_domain_id)
 
-                if last_embeddings:
-                    # Send the embedding shapes of the input
-                    result_queue.put(last_embeddings[0])
+                    # Clear previous embeddings buffer
+                    try:
+                        last_embeddings.clear()
+                    except Exception:
+                        pass
+
+                    # Run RKLLM to request last hidden layer (embeddings)
+                    model_ctypes.run(inference_mode, model_input_type, model_input)
+
+                    # Wait for callback to push embeddings to last_embeddings
+                    waited = 0
+                    emb_res = None
+                    while waited < 300:
+                        if last_embeddings:
+                            emb_res = last_embeddings[-1]
+                            break
+                        time.sleep(0.1)
+                        waited += 0.1
+
+                    if emb_res is None:
+                        logger.error(f"Timeout waiting for embeddings in worker for model {name}")
+                        result_queue.put(WORKER_TASK_ERROR)
+                    else:
+                        result_queue.put(emb_res)
+
+                except Exception as e:
+                    logger.error(f"Error during embedding (in-process ctypes): {e}")
+                    result_queue.put(WORKER_TASK_ERROR)
             
             elif task == WORKER_TASK_VISION_ENCODER:
                 logger.info(f"Running vision encoder for model {name}...")
@@ -240,8 +314,8 @@ def run_rkllm_worker(name, task_queue: Queue, result_queue: Queue, model_path, m
                 result_queue.put(WORKER_TASK_FINISHED)
 
         except Exception as e:
-            logger.error(f"Failed executing task the worker for model '{name}' for task '{task}': {str(e)}")
-            # Announce the creation of the RKLLM model in memory
+            logger.error(f"Failed executing task for worker '{name}' for task '{task}': {str(e)}")
+            # Announce error
             result_queue.put(WORKER_TASK_ERROR)
 
 
@@ -518,21 +592,63 @@ class WorkerManager:
             model_name (str): Workers to unload.
 
         """
-        if model_name in self.workers.keys():
-            # Get the queue of tasks of the worker
+        if model_name not in self.workers:
+            return
 
-            # Send the abort task of the model if currently is running some inference
-            self.workers[model_name].task_q.put((WORKER_TASK_ABORT_INFERENCE,None,None,None))
+        worker = self.workers[model_name]
 
-            # Send the unload task of the model
-            self.workers[model_name].task_q.put((WORKER_TASK_UNLOAD_MODEL,None,None,None))
+        # Best-effort graceful shutdown: abort any in-flight inference, then unload.
+        # NOTE: The worker loop processes one task at a time; if inference is wedged,
+        # we still need a hard stop to guarantee memory is released.
+        try:
+            worker.task_q.put((WORKER_TASK_ABORT_INFERENCE, None, None, None))
+            worker.task_q.put((WORKER_TASK_UNLOAD_MODEL, None, None, None))
+        except Exception as e:
+            logger.warning(f"Failed sending stop tasks to worker {model_name}: {e}")
 
-            # Wait for unload
-            self.workers[model_name].process.join()
-            logger.info(f"Worker {model_name} stopped...")
+        # Wait a bit for graceful exit.
+        join_timeout_s = 10
+        try:
+            worker.process.join(timeout=join_timeout_s)
+        except Exception as e:
+            logger.warning(f"Error while joining worker {model_name}: {e}")
 
-            # Remove the worker from the dictionary
-            del self.workers[model_name]
+        # If it didn't exit, force terminate/kill.
+        if worker.process is not None and worker.process.is_alive():
+            logger.warning(
+                f"Worker {model_name} did not exit after {join_timeout_s}s; terminating to free memory"
+            )
+            try:
+                worker.process.terminate()
+            except Exception as e:
+                logger.warning(f"Failed to terminate worker {model_name}: {e}")
+
+            try:
+                worker.process.join(timeout=5)
+            except Exception:
+                pass
+
+        if worker.process is not None and worker.process.is_alive():
+            logger.warning(f"Worker {model_name} still alive; killing")
+            try:
+                worker.process.kill()
+            except Exception as e:
+                logger.warning(f"Failed to kill worker {model_name}: {e}")
+
+            try:
+                worker.process.join(timeout=5)
+            except Exception:
+                pass
+
+        # Clean up queues (best-effort) and remove from registry.
+        try:
+            worker.task_q.close()
+            worker.result_q.close()
+        except Exception:
+            pass
+
+        del self.workers[model_name]
+        logger.info(f"Worker {model_name} stopped...")
 
     def stop_all(self):
         """
@@ -558,18 +674,25 @@ class WorkerManager:
             self.workers[model_name].task_q.put((WORKER_TASK_CLEAR_CACHE,None,None,None))
 
 
-    def inference(self, model_name, model_input):
+    def inference(self, model_name, model_input, prompt_text=None):
         """
         Send a inference task to the corresponding model worker
         
         Args:
             model_name (str): Model name to invoke
-            model_input (str): Input of the model
+            model_input: Input of the model (token IDs for ctypes, ignored for CLI)
+            prompt_text (str, optional): Raw text prompt for CLI-based workers
 
         """
         if model_name in self.workers.keys():
-            # Send the inference task
-            self.send_task(model_name, (WORKER_TASK_INFERENCE,RKLLMInferMode.RKLLM_INFER_GENERATE, RKLLMInputType.RKLLM_INPUT_TOKEN, model_input))
+            # For CLI-based workers, pass prompt_text; for ctypes workers, pass model_input
+            # We detect CLI workers by checking if prompt_text is provided
+            if prompt_text is not None:
+                # Send text prompt for CLI wrapper
+                self.send_task(model_name, (WORKER_TASK_INFERENCE,RKLLMInferMode.RKLLM_INFER_GENERATE, RKLLMInputType.RKLLM_INPUT_TOKEN, prompt_text))
+            else:
+                # Send token IDs for ctypes wrapper
+                self.send_task(model_name, (WORKER_TASK_INFERENCE,RKLLMInferMode.RKLLM_INFER_GENERATE, RKLLMInputType.RKLLM_INPUT_TOKEN, model_input))
 
     
     def embedding(self, model_name, model_input):

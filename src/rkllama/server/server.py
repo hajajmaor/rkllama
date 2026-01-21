@@ -6,6 +6,7 @@ from huggingface_hub import hf_hub_url, HfFileSystem
 from flask import Flask, request, jsonify, Response, stream_with_context, send_file
 from flask_cors import CORS
 import random
+import psutil
 
 # Local file
 from rkllama.api.classes import *
@@ -42,6 +43,15 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger("rkllama.server")
+
+# Increase debug level for key RKLLAMA modules so we capture worker/runtime details
+logging.getLogger('rkllama.worker').setLevel(logging.DEBUG)
+logging.getLogger('rkllama.rkllm').setLevel(logging.DEBUG)
+logging.getLogger('rkllama.server_utils').setLevel(logging.DEBUG)
+# Also enable verbose logging for HTTP and HuggingFace hub libs to trace 307/404
+logging.getLogger('urllib3').setLevel(logging.DEBUG)
+logging.getLogger('huggingface_hub').setLevel(logging.DEBUG)
+logging.getLogger('transformers').setLevel(logging.DEBUG)
 
 def print_color(message, color):
     # Function for displaying color messages
@@ -141,6 +151,20 @@ def load_model(model_name, huggingface_path=None, system="", From=None, request_
     # Get model parameters if not provided
     if not request_options:
         request_options = get_model_full_options(model_name, rkllama.config.get_path("models"), request_options)
+
+    # Quick safety check: ensure there is enough available RAM to attempt loading the model.
+    try:
+        model_file_path = os.path.join(model_dir, from_value)
+        if os.path.exists(model_file_path):
+            model_file_size = os.path.getsize(model_file_path)
+            available = psutil.virtual_memory().available
+            # Require at least 30% of model file size in available RAM as a heuristic (configurable if needed)
+            required = int(model_file_size * 0.30)
+            if available < required:
+                logger.error(f"Insufficient RAM to load model {model_name}: available={available}, required~{required}")
+                return None, f"Insufficient system memory to load {model_name} (available={available}, required~{required}). Consider unloading other models or using a smaller model variant."
+    except Exception as e:
+        logger.debug(f"Memory pre-check failed for model {model_name}: {e}")
 
     # Model loaded into memory
     model_loaded = variables.worker_manager_rkllm.add_worker(model_name, os.path.join(model_dir, from_value), model_dir, options=request_options)
@@ -342,7 +366,8 @@ def unload_model_route():
 # Route to unload a model from the NPU
 @app.route('/unload_models', methods=['POST'])
 def unload_models_route():
-    variables.worker_manager_rkllm.stop_all
+    # NOTE: stop_all is a function; it must be invoked.
+    variables.worker_manager_rkllm.stop_all()
     return jsonify({"message": "Models successfully unloaded!"}), 200
 
 # Route to retrieve the current models
@@ -1294,6 +1319,46 @@ if DEBUG_MODE:
                 "message": "No issues found in the response format"
             }), 200
 
+
+@app.route('/api/debug/workers', methods=['GET'])
+def debug_workers():
+    """Return status for each worker: pid, alive, RSS, loaded_at, last_call."""
+    try:
+        wm = variables.worker_manager_rkllm
+        workers = []
+        for name, worker in wm.workers.items():
+            pid = None
+            alive = False
+            rss = None
+            try:
+                if getattr(worker, 'process', None):
+                    pid = worker.process.pid
+                    alive = worker.process.is_alive()
+                    if pid:
+                        try:
+                            p = psutil.Process(pid)
+                            rss = p.memory_info().rss
+                        except Exception:
+                            rss = None
+            except Exception:
+                pass
+
+            info = {
+                'model': name,
+                'pid': pid,
+                'alive': alive,
+                'rss': rss,
+                'loaded_at': getattr(worker.worker_model_info, 'loaded_at', None) if getattr(worker, 'worker_model_info', None) else None,
+                'last_call': getattr(worker.worker_model_info, 'last_call', None) if getattr(worker, 'worker_model_info', None) else None,
+                'size': getattr(worker.worker_model_info, 'size', None) if getattr(worker, 'worker_model_info', None) else None,
+            }
+            workers.append(info)
+
+        return jsonify({'workers': workers}), 200
+    except Exception as e:
+        logger.exception(f"Failed to gather worker debug info: {e}")
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/embeddings', methods=['POST'])
 @app.route('/api/embed', methods=['POST'])
 @app.route('/v1/embeddings', methods=['POST'])
@@ -1625,15 +1690,23 @@ def main():
         if processor not in ["rk3588", "rk3576"]:
             print_color("Error: Invalid processor. Please enter rk3588 or rk3576.", "red")
             sys.exit(1)
-        if os.getuid() == 0:
-            print_color(f"Setting the frequency for the {processor} platform...", "cyan")
-            library_path = importlib.resources.files("rkllama.lib") / f"fix_freq_{processor}.sh"
-            #library_path = os.path.join(rkllama.config.get_path("lib"), f"fix_freq_{processor}.sh")
+        enable_freq_fix = rkllama.config.get("platform", "enable_freq_fix", True)
+        if os.getuid() == 0 and enable_freq_fix:
+            # In some containerized environments /sys is mounted read-only; avoid noisy failures.
+            if not os.access("/sys", os.W_OK):
+                print_color(
+                    "Skipping frequency fix script: /sys is not writable (set [platform].enable_freq_fix=false to silence).",
+                    "yellow",
+                )
+            else:
+                print_color(f"Setting the frequency for the {processor} platform...", "cyan")
+                library_path = importlib.resources.files("rkllama.lib") / f"fix_freq_{processor}.sh"
+                #library_path = os.path.join(rkllama.config.get_path("lib"), f"fix_freq_{processor}.sh")
 
-            # Pass debug flag as parameter to the shell script
-            debug_param = "1" if DEBUG_MODE else "0"
-            command = f"bash {library_path} {debug_param}"
-            subprocess.run(command, shell=True)
+                # Pass debug flag as parameter to the shell script
+                debug_param = "1" if DEBUG_MODE else "0"
+                command = f"bash {library_path} {debug_param}"
+                subprocess.run(command, shell=True)
 
     # Set the resource limits
     if os.getuid() == 0:
@@ -1644,7 +1717,16 @@ def main():
 
     # Set Flask debug mode to match our debug flag
     flask_debug = rkllama.config.is_debug_mode()
-    app.run(host=rkllama.config.get("server", "host", "0.0.0.0"), port=int(port), threaded=True, debug=flask_debug)
+    # In debug mode, Flask's default reloader spawns an extra process. That can lead to
+    # duplicate server processes and confusing worker/memory behavior on RKNN/RKLLM.
+    # Keep debug logging, but disable the reloader for predictable runtime behavior.
+    app.run(
+        host=rkllama.config.get("server", "host", "0.0.0.0"),
+        port=int(port),
+        threaded=True,
+        debug=flask_debug,
+        use_reloader=False,
+    )
 
 if __name__ == "__main__":
     main()

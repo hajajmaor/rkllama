@@ -277,6 +277,11 @@ def create_rkllama_schema() -> ConfigSchema:
     platform = schema.add_section("platform", description="Platform configuration")
     platform.string("processor", "rk3588", "Target processor", 
                    options=["rk3588", "rk3576"])
+    platform.boolean(
+        "enable_freq_fix",
+        True,
+        "Run platform frequency fix script (writes to /sys). Disable in containers or when /sys is read-only."
+    )
     
     return schema
 
