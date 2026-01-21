@@ -882,24 +882,35 @@ class EmbedEndpointHandler(EndpointHandler):
         except Exception:
             messages_for_prompt = [{"role": "user", "content": str(input_text)}]
 
-        # Create the prompts; tokenizer.chat_template may raise for some inputs — fallback to simple tokenization
+        # For embeddings we avoid chat template rendering and use simple tokenization of the input text
         try:
-            _, prompt_tokens, prompt_token_count, prompt_text = cls.prepare_prompt(model_name=model_name, messages=messages_for_prompt)
-        except Exception as e:
-            logger.debug(f"prepare_prompt failed, falling back to simple tokenization: {e}")
-            # Try to load tokenizer directly and encode the first input string
             models_root = rkllama.config.get_path("models")
             local_model_dir = os.path.join(models_root, model_name)
             local_tokenizer_dir = os.path.join(local_model_dir, "tokenizer")
             tokenizer_source = local_tokenizer_dir if os.path.isdir(local_tokenizer_dir) else get_property_modelfile(model_name, "HUGGINGFACE_PATH", rkllama.config.get_path("models")).replace('"','').replace("'", "")
-            try:
-                tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, trust_remote_code=True)
-            except Exception:
-                tokenizer = AutoTokenizer.from_pretrained(get_property_modelfile(model_name, "HUGGINGFACE_PATH", rkllama.config.get_path("models")), trust_remote_code=True)
 
-            # Determine a raw text to tokenize
-            if isinstance(input_text, list) and input_text:
-                first = input_text[0]
+            # Load tokenizer (respect cache behavior in prepare_prompt)
+            cache_key = f"{tokenizer_source}::{local_tokenizer_dir}"
+            with _TOKENIZER_CACHE_LOCK:
+                tokenizer = _TOKENIZER_CACHE.get(cache_key)
+
+            if tokenizer is None:
+                try:
+                    tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, trust_remote_code=True)
+                except Exception:
+                    tokenizer = AutoTokenizer.from_pretrained(get_property_modelfile(model_name, "HUGGINGFACE_PATH", rkllama.config.get_path("models")), trust_remote_code=True)
+                try:
+                    if not os.path.isdir(local_tokenizer_dir):
+                        os.makedirs(local_tokenizer_dir, exist_ok=True)
+                        tokenizer.save_pretrained(local_tokenizer_dir)
+                except Exception:
+                    pass
+                with _TOKENIZER_CACHE_LOCK:
+                    _TOKENIZER_CACHE[cache_key] = tokenizer
+
+            # Determine a raw text to tokenize (prefer first message content)
+            if isinstance(messages_for_prompt, list) and messages_for_prompt:
+                first = messages_for_prompt[0]
                 if isinstance(first, dict):
                     raw_text = first.get("content", "")
                 else:
@@ -909,6 +920,16 @@ class EmbedEndpointHandler(EndpointHandler):
 
             prompt_tokens = tokenizer.encode(raw_text, add_special_tokens=False)
             prompt_token_count = len(prompt_tokens)
+            prompt_text = raw_text
+        except Exception as e:
+            logger.exception(f"Failed to tokenize input for embeddings: {e}")
+            # Fallback to simple string wrapping
+            try:
+                raw_text = str(input_text[0]) if isinstance(input_text, list) and input_text else str(input_text)
+            except Exception:
+                raw_text = ""
+            prompt_tokens = []
+            prompt_token_count = 0
             prompt_text = raw_text
 
         # Ollama request handling 
