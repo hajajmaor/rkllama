@@ -1,5 +1,4 @@
-models/*/*.rkllm
-models/*/*
+models/
 src/__pycache__
 *.log
 config/config.env
@@ -24,7 +23,4 @@ ENV/
 .vscode/
 .idea/
 
-# Converter directory
-# Uncomment if you want to ignore it
-# converter/
 .env
